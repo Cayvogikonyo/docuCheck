@@ -1,0 +1,183 @@
+using System.IO;
+using System.Linq;
+using System.Xml.Linq;
+using System.Threading.Tasks;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+using DocumentFormat.OpenXml.Packaging;
+
+public class DocxSignatureCheckFunction
+{
+    private readonly ILogger _logger;
+
+    public DocxSignatureCheckFunction(ILogger<DocxSignatureCheckFunction> logger)
+    {
+        _logger = logger;
+    }
+
+    [Function("CheckSignatures")]
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequestData req)
+    {
+
+        // Validate file upload and content type
+        if (req.Body == null || !req.Headers.TryGetValues("Content-Type", out var contentType) ||
+            contentType.FirstOrDefault() != "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        {
+            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await errorResponse.WriteAsJsonAsync(new { Error = "Invalid or missing file. Please upload a valid .docx document." });
+            return errorResponse;
+        }
+        _logger.LogInformation("Processing Word document for signature validation...");
+
+        using var stream = new MemoryStream();
+        await req.Body.CopyToAsync(stream);
+        using var doc = WordprocessingDocument.Open(stream, false);
+
+        var mainPart = doc.MainDocumentPart;
+
+        // Check if document is digitally signed
+        bool isDigitallySigned = doc.DigitalSignatureOriginPart != null;
+
+        // Extract signature lines
+        XDocument xDoc = XDocument.Parse(mainPart.Document.InnerXml);
+        XNamespace o = "urn:schemas-microsoft-com:office:office";
+        var signatureLines = xDoc.Descendants(o + "signatureline").ToList();
+
+        var resultList = signatureLines.Select(signature =>
+        {
+            string signerName = signature.Attribute(o+"suggestedsigner")?.Value ?? "Unknown";
+            string signerEmail = signature.Attribute(o+"suggestedsigneremail")?.Value ?? "Unknown";
+            bool hasSignatureLine = signature.Attribute("issignatureline")?.Value == "t";
+            bool isSigned = isDigitallySigned && VerifySignature(doc, signerName);
+
+            return new
+            {
+                SuggestedSigner = signerName,
+                Email = signerEmail,
+                Signed = isSigned
+            };
+        }).ToList();
+
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        await response.WriteAsJsonAsync(new { DocumentSigned = isDigitallySigned, SignatureLines = resultList });
+
+        return response;
+    }
+
+    private static bool VerifySignature(WordprocessingDocument doc, string signerName)
+    {
+        var signatureOrigin = doc.DigitalSignatureOriginPart;
+        if (signatureOrigin == null) return false;
+
+        foreach (var part in signatureOrigin.Parts)
+        {
+            using var sigStream = part.OpenXmlPart.GetStream();
+            XDocument sigXml = XDocument.Load(sigStream);
+
+            var actualSigner = sigXml.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == "X509IssuerName")?.Value;
+
+            if (actualSigner != null && actualSigner.IndexOf(signerName, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        return false;
+    }
+}
+
+
+
+
+
+
+using System.IO;
+using System.Linq;
+using System.Xml.Linq;
+using System.Threading.Tasks;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+using DocumentFormat.OpenXml.Packaging;
+
+public class CheckNextSignerFunction
+{
+    private readonly ILogger _logger;
+
+    public CheckNextSignerFunction(ILogger<CheckNextSignerFunction> logger)
+    {
+        _logger = logger;
+    }
+
+    [Function("CheckNextSigner")]
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Anonymous, "post")] HttpRequestData req)
+    {
+
+        // Validate file upload and content type
+        if (req.Body == null || !req.Headers.TryGetValues("Content-Type", out var contentType) ||
+            contentType.FirstOrDefault() != "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        {
+            var errorResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await errorResponse.WriteAsJsonAsync(new { Error = "Invalid or missing file. Please upload a valid .docx document." });
+            return errorResponse;
+        }
+
+        _logger.LogInformation("Processing Word document for signature validation...");
+
+        using var stream = new MemoryStream();
+        await req.Body.CopyToAsync(stream);
+        using var doc = WordprocessingDocument.Open(stream, false);
+
+        var mainPart = doc.MainDocumentPart;
+
+        // Check if document is digitally signed
+        bool isDigitallySigned = doc.DigitalSignatureOriginPart != null;
+
+        // Extract signature lines
+        XDocument xDoc = XDocument.Parse(mainPart.Document.InnerXml);
+        XNamespace o = "urn:schemas-microsoft-com:office:office";
+        var signatureLines = xDoc.Descendants(o + "signatureline").ToList();
+
+        // Find the first expected signer who has not signed
+        var firstUnsignedSigner = signatureLines
+            .Select(signature =>
+            {
+                string signerName = signature.Attribute(o + "suggestedsigner")?.Value ?? "Unknown";
+                string signerEmail = signature.Attribute(o + "suggestedsigneremail")?.Value ?? "Unknown";
+                bool hasSignatureLine = signature.Attribute("issignatureline")?.Value == "t";
+                bool isSigned = isDigitallySigned && VerifySignature(doc, signerName);
+
+                return new { SuggestedSigner = signerName, Email = signerEmail, Signed = isSigned };
+            })
+            .FirstOrDefault(signer => !signer.Signed); // Stop at the first unsigned signer
+
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        await response.WriteAsJsonAsync(new { FirstUnsignedSigner = firstUnsignedSigner });
+
+        return response;
+    }
+
+    private static bool VerifySignature(WordprocessingDocument doc, string signerName)
+    {
+        var signatureOrigin = doc.DigitalSignatureOriginPart;
+        if (signatureOrigin == null) return false;
+
+        foreach (var part in signatureOrigin.Parts)
+        {
+            using var sigStream = part.OpenXmlPart.GetStream();
+            XDocument sigXml = XDocument.Load(sigStream);
+
+            var actualSigner = sigXml.Descendants()
+                .FirstOrDefault(e => e.Name.LocalName == "X509IssuerName")?.Value;
+            
+            Console.WriteLine($"Hmmmm: {actualSigner}");
+
+            if (actualSigner != null && actualSigner.IndexOf(signerName, StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        return false;
+    }
+}
+
+
